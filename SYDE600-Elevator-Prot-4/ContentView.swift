@@ -34,22 +34,121 @@ class ElevatorDisplayViewController: ObservableObject {
 class FloorSelectorViewController: ObservableObject {
     private let model: ElevatorModel
     
+    // Scrolling state - handled in view, not model
+    @Published var shouldAllowAutoScroll: Bool = true
+    @Published var autoscrollDisableDuration: TimeInterval = 5.0
+    @Published var shouldScrollToCurrentFloor: Bool = false // Triggers manual scroll to current floor
+    @Published var scrollToFloor: Int? = nil // The floor to scroll to when shouldScrollToCurrentFloor is true
+    
+    private var scrollIdleTimer: Timer?
+    private var lastScrollTime: Date = Date()
+    
     init(model: ElevatorModel) {
         self.model = model
     }
     
-    func selectFloor(_ floor: Int) {
-        Task {
-            await model.selectFloor(floor)
+    deinit {
+        scrollIdleTimer?.invalidate()
+    }
+    
+    /// Called when user presses a floor button
+    func enqueueFloor(_ floor: Int) {
+        model.enqueue(floor)
+    }
+    
+    /// Called when user starts scrolling - disable autoscroll
+    func handleUserScrolling() {
+        shouldAllowAutoScroll = false
+        lastScrollTime = Date()
+        
+        // Invalidate existing timer
+        scrollIdleTimer?.invalidate()
+        
+        // Set new timer with configurable duration
+        scrollIdleTimer = Timer.scheduledTimer(withTimeInterval: autoscrollDisableDuration, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                let timeSinceLastScroll = Date().timeIntervalSince(self.lastScrollTime)
+                guard timeSinceLastScroll >= self.autoscrollDisableDuration else {
+                    // Reschedule if not enough time has passed
+                    let remainingTime = self.autoscrollDisableDuration - timeSinceLastScroll
+                    self.scrollIdleTimer?.invalidate()
+                    self.scrollIdleTimer = Timer.scheduledTimer(withTimeInterval: remainingTime, repeats: false) { [weak self] _ in
+                        Task { @MainActor in
+                            guard let self = self,
+                                  Date().timeIntervalSince(self.lastScrollTime) >= self.autoscrollDisableDuration else {
+                                return
+                            }
+                            self.shouldAllowAutoScroll = true
+                        }
+                    }
+                    return
+                }
+                self.shouldAllowAutoScroll = true
+            }
         }
     }
     
-    func handleUserScrolling() {
-        model.handleUserInteraction()
+    /// Called when user stops scrolling
+    func handleUserScrollRelease() {
+        lastScrollTime = Date()
+        // Timer will handle re-enabling autoscroll
     }
     
-    func handleUserScrollRelease() {
-        model.handleUserRelease()
+    /// Set the duration (in seconds) that autoscroll should be disabled after scrolling
+    func setAutoscrollDisableDuration(_ duration: TimeInterval) {
+        autoscrollDisableDuration = max(1.0, duration)
+    }
+    
+    /// Centralized function to perform auto scroll to a specific floor
+    /// - Parameters:
+    ///   - floor: The floor number to scroll to (defaults to current floor from model)
+    ///   - force: If true, enables autoscroll even if it was disabled (default: true)
+    ///   - delay: Optional delay in seconds before scrolling (default: 0)
+    func performAutoScroll(to floor: Int? = nil, force: Bool = true, delay: TimeInterval = 0) {
+        if force {
+            shouldAllowAutoScroll = true
+        }
+        
+        // Cancel any existing timer
+        scrollIdleTimer?.invalidate()
+        
+        let targetFloor = floor ?? model.currentFloor
+        scrollToFloor = targetFloor
+        
+        if delay > 0 {
+            // Schedule scroll after delay
+            scrollIdleTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self = self else { return }
+                    self.shouldScrollToCurrentFloor = true
+                    // Reset the flag after a brief moment
+                    Task {
+                        try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+                        await MainActor.run {
+                            self.shouldScrollToCurrentFloor = false
+                            self.scrollToFloor = nil
+                        }
+                    }
+                }
+            }
+        } else {
+            // Scroll immediately
+            shouldScrollToCurrentFloor = true
+            // Reset the flag after a brief moment
+            Task {
+                try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+                await MainActor.run {
+                    shouldScrollToCurrentFloor = false
+                    scrollToFloor = nil
+                }
+            }
+        }
+    }
+    
+    /// Perform auto scroll to current floor (convenience method for button)
+    func performAutoScroll() {
+        performAutoScroll(to: nil, force: true, delay: 0)
     }
 }
 
@@ -79,7 +178,8 @@ struct ContentView: View {
                 // Left half - Elevator doors and display
                 ElevatorDisplayView(
                     model: controller.model,
-                    viewController: controller.displayViewController,
+                    displayViewController: controller.displayViewController,
+                    floorSelectorViewController: controller.floorSelectorViewController,
                     geometry: geometry
                 )
                 .frame(width: geometry.size.width / 2)
@@ -104,7 +204,8 @@ struct ContentView: View {
 
 struct ElevatorDisplayView: View {
     @ObservedObject var model: ElevatorModel
-    @ObservedObject var viewController: ElevatorDisplayViewController
+    @ObservedObject var displayViewController: ElevatorDisplayViewController
+    @ObservedObject var floorSelectorViewController: FloorSelectorViewController
     let geometry: GeometryProxy
     
     var body: some View {
@@ -143,11 +244,11 @@ struct ElevatorDisplayView: View {
             }
             .frame(maxWidth: .infinity)
 
-            // Customer Support Button section
-            VStack(spacing: 15) {
+            // Customer Support and Auto Scroll Buttons section
+            HStack(spacing: 15) {
                 // Customer Support Button
                 Button(action: {
-                    viewController.showSupport()
+                    displayViewController.showSupport()
                 }) {
                     HStack {
                         Image(systemName: "phone.fill")
@@ -155,18 +256,37 @@ struct ElevatorDisplayView: View {
                             .font(.title2)
                     }
                     .foregroundColor(.white)
-                    .padding(.horizontal, 40)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 20)
                     .padding(.vertical, 20)
                     .background(Color.red)
                     .cornerRadius(15)
                 }
+                
+                // Auto Scroll Button
+                Button(action: {
+                    floorSelectorViewController.performAutoScroll()
+                }) {
+                    HStack {
+                        Image(systemName: "arrow.down.circle.fill")
+                        Text("Auto Scroll")
+                            .font(.title2)
+                    }
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 20)
+                    .background(Color.blue)
+                    .cornerRadius(15)
+                }
             }
             .frame(maxWidth: .infinity)
+            .padding(.horizontal, 20)
             .padding(.bottom, 50)
         }
-        .alert("Customer Support", isPresented: $viewController.showCustomerSupport) {
+        .alert("Customer Support", isPresented: $displayViewController.showCustomerSupport) {
             Button("Close", role: .cancel) {
-                viewController.hideSupport()
+                displayViewController.hideSupport()
             }
         } message: {
             Text("Emergency support is available 24/7.\nCall: 1-800-ELEVATOR")
@@ -199,12 +319,13 @@ struct FloorSelectorView: View {
                                 isCurrent: model.currentFloor == floor,
                                 isQueued: model.queuedFloors.contains(floor)
                             ) {
-                                viewController.selectFloor(floor)
+                                viewController.enqueueFloor(floor)
                             }
                             .id(floor)
                         }
                     }
                 }
+                .scrollIndicators(.hidden)
                 .onAppear {
                     // Scroll to floor 1 at the bottom on start
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -214,14 +335,29 @@ struct FloorSelectorView: View {
                     }
                 }
                 .onChange(of: model.currentFloor) { _, newFloor in
-                    // Always update scroll position when elevator moves
+                    // When elevator state changes, use centralized autoscroll function
                     if model.elevatorState == .moving {
-                        if model.shouldAllowAutoScroll {
-                            withAnimation(.easeInOut(duration: 0.5)) {
-                                proxy.scrollTo(newFloor, anchor: .center)
-                            }
-                        } else {
-                            proxy.scrollTo(newFloor, anchor: .center)
+                        if viewController.shouldAllowAutoScroll {
+                            // Use centralized function to scroll to new floor
+                            viewController.performAutoScroll(to: newFloor, force: false, delay: 0)
+                        }
+                        // If autoscroll is disabled, don't scroll (user is manually scrolling)
+                    }
+                }
+                .onChange(of: model.elevatorState) { _, newState in
+                    // When elevator stops at a floor, scroll to current floor after a brief delay
+                    if newState == .stopped && model.doorState == .open {
+                        if viewController.shouldAllowAutoScroll {
+                            // Scroll to current floor after doors open (0.5 second delay)
+                            viewController.performAutoScroll(to: model.currentFloor, force: false, delay: 0.5)
+                        }
+                    }
+                }
+                .onChange(of: viewController.shouldScrollToCurrentFloor) { _, shouldScroll in
+                    // When auto scroll is triggered (button or elevator), scroll to target floor
+                    if shouldScroll, let targetFloor = viewController.scrollToFloor {
+                        withAnimation(.easeInOut(duration: 0.5)) {
+                            proxy.scrollTo(targetFloor, anchor: .center)
                         }
                     }
                 }
@@ -229,8 +365,10 @@ struct FloorSelectorView: View {
                     // Use SwiftUI's built-in scroll phase detection
                     switch newPhase {
                     case .interacting:
+                        // User started scrolling - disable autoscroll and set timer
                         viewController.handleUserScrolling()
                     case .idle:
+                        // User stopped scrolling - update last interaction time
                         viewController.handleUserScrollRelease()
                     default:
                         break

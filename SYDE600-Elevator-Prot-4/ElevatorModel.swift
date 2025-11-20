@@ -25,11 +25,6 @@ enum DoorState {
     case closing      // Doors are closing
 }
 
-enum ScrollPanelState {
-    case idle         // No touch events for 5+ seconds
-    case selection    // User is touching/interacting
-}
-
 // MARK: - Elevator Model
 @MainActor
 class ElevatorModel: ObservableObject {
@@ -43,12 +38,8 @@ class ElevatorModel: ObservableObject {
     @Published var currentDirection: Int = 0 // -1 for down, 1 for up, 0 for idle
     @Published var upReverseFloor: Int = 0
     @Published var downReverseFloor: Int = 0
-    @Published var scrollPanelState: ScrollPanelState = .idle
-    @Published var shouldAllowAutoScroll: Bool = true
     
     private var floorChangeTimer: Timer?
-    private var touchIdleTimer: Timer?
-    private var lastTouchTime: Date = Date()
     
     #if os(iOS)
     private var arrivalPlayer: AVAudioPlayer?
@@ -64,8 +55,6 @@ class ElevatorModel: ObservableObject {
         // Clean up timers synchronously in deinit
         floorChangeTimer?.invalidate()
         floorChangeTimer = nil
-        touchIdleTimer?.invalidate()
-        touchIdleTimer = nil
     }
     
     var elevatorStateText: String {
@@ -91,8 +80,6 @@ class ElevatorModel: ObservableObject {
     func cleanupTimers() async {
         floorChangeTimer?.invalidate()
         floorChangeTimer = nil
-        touchIdleTimer?.invalidate()
-        touchIdleTimer = nil
     }
     
     private func playArrivalChime() {
@@ -119,40 +106,6 @@ class ElevatorModel: ObservableObject {
         #endif
     }
     
-    func handleUserInteraction() {
-        scrollPanelState = .selection
-        shouldAllowAutoScroll = false
-        lastTouchTime = Date()
-        
-        touchIdleTimer?.invalidate()
-        
-        touchIdleTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                // Double-check that 5 seconds have actually passed since last interaction
-                guard let self = self, 
-                      Date().timeIntervalSince(self.lastTouchTime) >= 5.0 else {
-                    return
-                }
-                self.scrollPanelState = .idle
-                self.shouldAllowAutoScroll = true
-            }
-        }
-    }
-    
-    func handleUserRelease() {
-        // Reset the touch timer when user releases
-        lastTouchTime = Date()
-        
-        // Give a short delay before re-enabling auto scroll
-        Task {
-            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
-            await MainActor.run {
-                if scrollPanelState == .idle {
-                    shouldAllowAutoScroll = true
-                }
-            }
-        }
-    }
     
     func calculateReverseFloors() {
         guard !queuedFloors.isEmpty else {
@@ -166,22 +119,24 @@ class ElevatorModel: ObservableObject {
         downReverseFloor = sortedFloors.min() ?? 0
     }
     
-    func selectFloor(_ floor: Int) async {
-        // Update selected floor in model (on main thread)
-        selectedFloor = floor
-        print("DEBUG: Selected floor set to \(floor)")
+    /// Enqueue or dequeue a floor when user presses the button
+    func enqueue(_ floor: Int) {
+        print("DEBUG: enqueue(\(floor)) called")
         
-        guard floor != currentFloor else { 
+        // Set selected floor for visual feedback
+        selectedFloor = floor
+        
+        guard floor != currentFloor else {
             // Clear selection after a brief moment if selecting current floor
             Task {
                 try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
-                selectedFloor = 0 // Clear selection
+                selectedFloor = 0
                 print("DEBUG: Cleared selection (was current floor)")
             }
-            return 
+            return
         }
-
-        // Floor selection logic on main thread
+        
+        // Toggle floor in queue
         if queuedFloors.contains(floor) {
             queuedFloors.remove(floor)
             calculateReverseFloors()
@@ -190,7 +145,8 @@ class ElevatorModel: ObservableObject {
             queuedFloors.insert(floor)
             calculateReverseFloors()
             print("DEBUG: Added floor \(floor) to queue")
-
+            
+            // Start elevator journey if idle
             if elevatorState == .idle {
                 startElevatorJourney()
             }
@@ -199,7 +155,7 @@ class ElevatorModel: ObservableObject {
         // Clear selection after a brief moment
         Task {
             try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
-            selectedFloor = 0 // Clear selection so it shows proper state
+            selectedFloor = 0
             print("DEBUG: Cleared selection after delay")
         }
     }
@@ -281,8 +237,6 @@ class ElevatorModel: ObservableObject {
         // Cancel all timers and tasks
         floorChangeTimer?.invalidate()
         floorChangeTimer = nil
-        touchIdleTimer?.invalidate() 
-        touchIdleTimer = nil
         
         // Set to idle state with doors closed
         elevatorState = .idle
