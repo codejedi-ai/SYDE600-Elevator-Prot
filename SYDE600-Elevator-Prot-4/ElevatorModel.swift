@@ -251,57 +251,98 @@ class ElevatorModel: ObservableObject {
         print("DEBUG: All elevator operations halted")
     }
     
-    // MARK: - Door State Management
+    // MARK: - Public Interface: View-Model Interaction
+    // The View and Model interact ONLY through these functions:
+    // 1. enqueue(floor) - when user presses a floor button
+    // 2. displayFloor(floor) - when elevator arrives at a floor (includes complete door cycle)
+    // 3. doorOpen() - play door opening animation (state set BEFORE animation)
+    // 4. doorClose() - play door closing animation (state set BEFORE animation)
     
-    /// Open doors animation (only when stopped and doors closed)
-    private func openDoors() {
+    /// Called when elevator arrives at a floor - displays floor and handles complete door cycle
+    /// This includes: door opening animation, door opened state (3 seconds), and door closing animation
+    /// The view can call this, or it's called internally when the elevator stops at a queued floor
+    func displayFloor(_ floor: Int) async {
+        print("DEBUG: displayFloor(\(floor)) called")
+        
+        // Ensure elevator is stopped at the correct floor
+        guard elevatorState == .stopped && currentFloor == floor else {
+            print("DEBUG: Cannot display floor - elevator state: \(elevatorState), current floor: \(currentFloor), target: \(floor)")
+            return
+        }
+        
+        // Ensure doors are closed before starting
+        guard doorState == .closed else {
+            print("DEBUG: Cannot display floor - doors are not closed (state: \(doorState))")
+            return
+        }
+        
+        // Start door cycle: open → wait → close
+        await handleDoorCycle()
+    }
+    
+    /// Play door opening animation
+    /// Sets door state to .opening BEFORE the animation plays
+    func doorOpen() {
         guard elevatorState == .stopped && doorState == .closed else {
             print("DEBUG: Cannot open doors - elevator state: \(elevatorState), door state: \(doorState)")
             return
         }
         
-        print("DEBUG: openDoors() - Starting door opening animation at floor \(currentFloor)")
+        print("DEBUG: doorOpen() - Setting state to opening BEFORE animation at floor \(currentFloor)")
         
-        // DURING ANIMATION: Set to opening state
+        // SET STATE BEFORE ANIMATION
         doorState = .opening
         doorOffset = 1.0
         
         // Play arrival chime
         playArrivalChime()
         
-        // AFTER ANIMATION COMPLETES: Transition to open state
+        // Animation plays (view observes doorOffset change)
+        // After animation completes, transition to open state
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             self.doorState = .open
-            print("DEBUG: openDoors() - Animation complete, doors are now OPEN")
+            print("DEBUG: doorOpen() - Animation complete, doors are now OPEN")
             
-            // Assert that we're in the correct state after animation
             assert(self.elevatorState == .stopped, "Elevator should be stopped after door opening")
             assert(self.doorState == .open, "Doors should be open after opening animation")
         }
     }
     
-    /// Close doors animation (only when stopped and doors open)
-    private func closeDoors() {
+    /// Play door closing animation
+    /// Sets door state to .closing BEFORE the animation plays
+    func doorClose() {
         guard elevatorState == .stopped && doorState == .open else {
             print("DEBUG: Cannot close doors - elevator state: \(elevatorState), door state: \(doorState)")
             return
         }
         
-        print("DEBUG: closeDoors() - Starting door closing animation at floor \(currentFloor)")
+        print("DEBUG: doorClose() - Setting state to closing BEFORE animation at floor \(currentFloor)")
         
-        // DURING ANIMATION: Set to closing state
+        // SET STATE BEFORE ANIMATION
         doorState = .closing
         doorOffset = 0.0
         
-        // AFTER ANIMATION COMPLETES: Transition to closed state
+        // Animation plays (view observes doorOffset change)
+        // After animation completes, transition to closed state
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             self.doorState = .closed
-            print("DEBUG: closeDoors() - Animation complete, doors are now CLOSED - elevator can move again")
+            print("DEBUG: doorClose() - Animation complete, doors are now CLOSED")
             
-            // Assert that we're in the correct state after animation
             assert(self.elevatorState == .stopped, "Elevator should be stopped after door closing")
             assert(self.doorState == .closed, "Doors should be closed after closing animation")
         }
+    }
+    
+    // MARK: - Door State Management (Internal)
+    
+    /// Internal function to open doors (used by handleDoorCycle)
+    private func openDoors() {
+        doorOpen()
+    }
+    
+    /// Internal function to close doors (used by handleDoorCycle)
+    private func closeDoors() {
+        doorClose()
     }
     
     /// Complete door cycle: open → wait 3 seconds → close
@@ -361,6 +402,7 @@ class ElevatorModel: ObservableObject {
     }
     
     /// Force doors to close immediately (for emergency or testing)
+    /// Uses the public doorClose() function
     func forceCloseDoors() {
         guard elevatorState == .stopped && doorState == .open else {
             print("DEBUG: Cannot force close doors - elevator state: \(elevatorState), door state: \(doorState)")
@@ -370,7 +412,8 @@ class ElevatorModel: ObservableObject {
         print("DEBUG: FORCE closing doors at floor \(currentFloor)")
         doorOpenCountdown = 0  // Clear countdown immediately
         
-        closeDoors()
+        // Use public doorClose() function
+        doorClose()
         
         // Wait for door closing animation to complete before checking next movement
         Task {
@@ -388,13 +431,14 @@ class ElevatorModel: ObservableObject {
         }
     }
     
-    /// Test door timing by stopping at current floor and opening doors
+    /// Test door timing by stopping at current floor and displaying it
+    /// Uses the public displayFloor() function
     func testDoorTiming() {
         print("DEBUG: Testing door timing at current floor \(currentFloor)")
         elevatorState = .stopped
         doorState = .closed
         Task {
-            await handleDoorCycle()
+            await displayFloor(currentFloor)
         }
     }
     
@@ -506,12 +550,12 @@ class ElevatorModel: ObservableObject {
         if queuedFloors.contains(currentFloor) {
             queuedFloors.remove(currentFloor)
             calculateReverseFloors()
-            print("DEBUG: Elevator stopped at queued floor \(currentFloor) - will open doors")
+            print("DEBUG: Elevator stopped at queued floor \(currentFloor) - will display floor")
             
-            // Start the structured door cycle
+            // Call displayFloor to handle door cycle
             Task {
                 try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds brief delay
-                await self.handleDoorCycle()
+                await self.displayFloor(self.currentFloor)
             }
         } else {
             print("DEBUG: Elevator stopped at floor \(currentFloor) - checking for next move")
