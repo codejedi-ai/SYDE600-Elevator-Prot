@@ -100,6 +100,17 @@ class FloorSelectorViewController: ObservableObject {
         autoscrollDisableDuration = max(1.0, duration)
     }
     
+    /// Helper function to reset scroll flags after a brief delay
+    private func resetScrollFlags() {
+        Task {
+            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+            await MainActor.run {
+                shouldScrollToCurrentFloor = false
+                scrollToFloor = nil
+            }
+        }
+    }
+    
     /// Centralized function to perform auto scroll to a specific floor
     /// - Parameters:
     ///   - floor: The floor number to scroll to (defaults to current floor from model)
@@ -122,27 +133,13 @@ class FloorSelectorViewController: ObservableObject {
                 Task { @MainActor in
                     guard let self = self else { return }
                     self.shouldScrollToCurrentFloor = true
-                    // Reset the flag after a brief moment
-                    Task {
-                        try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
-                        await MainActor.run {
-                            self.shouldScrollToCurrentFloor = false
-                            self.scrollToFloor = nil
-                        }
-                    }
+                    self.resetScrollFlags()
                 }
             }
         } else {
             // Scroll immediately
             shouldScrollToCurrentFloor = true
-            // Reset the flag after a brief moment
-            Task {
-                try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
-                await MainActor.run {
-                    shouldScrollToCurrentFloor = false
-                    scrollToFloor = nil
-                }
-            }
+            resetScrollFlags()
         }
     }
     
@@ -247,38 +244,24 @@ struct ElevatorDisplayView: View {
             // Customer Support and Auto Scroll Buttons section
             HStack(spacing: 15) {
                 // Customer Support Button
-                Button(action: {
-                    displayViewController.showSupport()
-                }) {
-                    HStack {
-                        Image(systemName: "phone.fill")
-                        Text("Customer Support")
-                            .font(.title2)
+                ActionButton(
+                    icon: "phone.fill",
+                    title: "Customer Support",
+                    color: .red,
+                    action: {
+                        displayViewController.showSupport()
                     }
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 20)
-                    .background(Color.red)
-                    .cornerRadius(15)
-                }
+                )
                 
                 // Auto Scroll Button
-                Button(action: {
-                    floorSelectorViewController.performAutoScroll()
-                }) {
-                    HStack {
-                        Image(systemName: "arrow.down.circle.fill")
-                        Text("Auto Scroll")
-                            .font(.title2)
+                ActionButton(
+                    icon: "arrow.down.circle.fill",
+                    title: "Auto Scroll",
+                    color: .blue,
+                    action: {
+                        floorSelectorViewController.performAutoScroll()
                     }
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 20)
-                    .background(Color.blue)
-                    .cornerRadius(15)
-                }
+                )
             }
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 20)
@@ -379,6 +362,31 @@ struct FloorSelectorView: View {
     }
 }
 
+
+// MARK: - Reusable Components
+
+struct ActionButton: View {
+    let icon: String
+    let title: String
+    let color: Color
+    let action: () -> Void
+    
+    var body: some View {
+        Button(action: action) {
+            HStack {
+                Image(systemName: icon)
+                Text(title)
+                    .font(.title2)
+            }
+            .foregroundColor(.white)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 20)
+            .background(color)
+            .cornerRadius(15)
+        }
+    }
+}
 
 struct FloorButton: View {
     let floor: Int

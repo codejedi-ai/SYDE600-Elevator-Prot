@@ -119,6 +119,17 @@ class ElevatorModel: ObservableObject {
         downReverseFloor = sortedFloors.min() ?? 0
     }
     
+    /// Helper function to clear selected floor after a delay
+    private func clearSelectedFloor(after delay: TimeInterval = 0.5, reason: String = "") {
+        Task {
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            selectedFloor = 0
+            if !reason.isEmpty {
+                print("DEBUG: Cleared selection (\(reason))")
+            }
+        }
+    }
+    
     /// Enqueue or dequeue a floor when user presses the button
     func enqueue(_ floor: Int) {
         print("DEBUG: enqueue(\(floor)) called")
@@ -128,11 +139,7 @@ class ElevatorModel: ObservableObject {
         
         guard floor != currentFloor else {
             // Clear selection after a brief moment if selecting current floor
-            Task {
-                try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
-                selectedFloor = 0
-                print("DEBUG: Cleared selection (was current floor)")
-            }
+            clearSelectedFloor(reason: "was current floor")
             return
         }
         
@@ -153,11 +160,7 @@ class ElevatorModel: ObservableObject {
         }
         
         // Clear selection after a brief moment
-        Task {
-            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
-            selectedFloor = 0
-            print("DEBUG: Cleared selection after delay")
-        }
+        clearSelectedFloor(reason: "after delay")
     }
 
     func startElevatorJourney() {
