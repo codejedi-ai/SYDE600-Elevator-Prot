@@ -13,12 +13,16 @@ import AVFoundation
 
 // MARK: - Model Enums
 enum ElevatorState {
-    case idle
-    case stopped      // At a floor but not moving
-    case doorsOpening
-    case doorsOpen
-    case doorsClosing
-    case moving       // Actually moving between floors
+    case idle         // Not in use
+    case moving       // Moving between floors
+    case stopped      // Stopped at a floor (people can enter/exit)
+}
+
+enum DoorState {
+    case closed       // Doors are closed
+    case opening      // Doors are opening
+    case open         // Doors are open (people can enter/exit)
+    case closing      // Doors are closing
 }
 
 enum ScrollPanelState {
@@ -30,16 +34,21 @@ enum ScrollPanelState {
 @MainActor
 class ElevatorModel: ObservableObject {
     @Published var currentFloor: Int = 1
+    @Published var selectedFloor: Int = 0
     @Published var elevatorState: ElevatorState = .idle
+    @Published var doorState: DoorState = .closed
     @Published var doorOffset: CGFloat = 0
+    @Published var doorOpenCountdown: Int = 0  // Countdown timer for door open state
     @Published var queuedFloors: Set<Int> = []
     @Published var currentDirection: Int = 0 // -1 for down, 1 for up, 0 for idle
     @Published var upReverseFloor: Int = 0
     @Published var downReverseFloor: Int = 0
     @Published var scrollPanelState: ScrollPanelState = .idle
+    @Published var shouldAllowAutoScroll: Bool = true
     
     private var floorChangeTimer: Timer?
-    private var lastUserReleaseTime: Date = Date()
+    private var touchIdleTimer: Timer?
+    private var lastTouchTime: Date = Date()
     
     #if os(iOS)
     private var arrivalPlayer: AVAudioPlayer?
@@ -52,31 +61,38 @@ class ElevatorModel: ObservableObject {
     }
     
     deinit {
-        // Clean up timer synchronously in deinit
+        // Clean up timers synchronously in deinit
         floorChangeTimer?.invalidate()
         floorChangeTimer = nil
+        touchIdleTimer?.invalidate()
+        touchIdleTimer = nil
     }
     
     var elevatorStateText: String {
         switch elevatorState {
         case .idle:
             return "Idle"
-        case .stopped:
-            return "Stopped"
         case .moving:
             return currentDirection > 0 ? "Going Up ↑" : "Going Down ↓"
-        case .doorsOpening:
-            return "Doors Opening"
-        case .doorsOpen:
-            return "Doors Open"
-        case .doorsClosing:
-            return "Doors Closing"
+        case .stopped:
+            switch doorState {
+            case .closed:
+                return "Stopped - Doors Closed"
+            case .opening:
+                return "Stopped - Doors Opening"
+            case .open:
+                return "Stopped - Doors Open"
+            case .closing:
+                return "Stopped - Doors Closing"
+            }
         }
     }
     
     func cleanupTimers() async {
         floorChangeTimer?.invalidate()
         floorChangeTimer = nil
+        touchIdleTimer?.invalidate()
+        touchIdleTimer = nil
     }
     
     private func playArrivalChime() {
@@ -105,15 +121,37 @@ class ElevatorModel: ObservableObject {
     
     func handleUserInteraction() {
         scrollPanelState = .selection
+        shouldAllowAutoScroll = false
+        lastTouchTime = Date()
+        
+        touchIdleTimer?.invalidate()
+        
+        touchIdleTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                // Double-check that 5 seconds have actually passed since last interaction
+                guard let self = self, 
+                      Date().timeIntervalSince(self.lastTouchTime) >= 5.0 else {
+                    return
+                }
+                self.scrollPanelState = .idle
+                self.shouldAllowAutoScroll = true
+            }
+        }
     }
     
     func handleUserRelease() {
-        lastUserReleaseTime = Date()
-        scrollPanelState = .selection
-    }
-    
-    var shouldAllowAutoScroll: Bool {
-        Date().timeIntervalSince(lastUserReleaseTime) >= 5.0
+        // Reset the touch timer when user releases
+        lastTouchTime = Date()
+        
+        // Give a short delay before re-enabling auto scroll
+        Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+            await MainActor.run {
+                if scrollPanelState == .idle {
+                    shouldAllowAutoScroll = true
+                }
+            }
+        }
     }
     
     func calculateReverseFloors() {
@@ -127,9 +165,57 @@ class ElevatorModel: ObservableObject {
         upReverseFloor = sortedFloors.max() ?? 0
         downReverseFloor = sortedFloors.min() ?? 0
     }
+    
+    func selectFloor(_ floor: Int) async {
+        // Update selected floor in model (on main thread)
+        selectedFloor = floor
+        print("DEBUG: Selected floor set to \(floor)")
+        
+        guard floor != currentFloor else { 
+            // Clear selection after a brief moment if selecting current floor
+            Task {
+                try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+                selectedFloor = 0 // Clear selection
+                print("DEBUG: Cleared selection (was current floor)")
+            }
+            return 
+        }
+
+        // Floor selection logic on main thread
+        if queuedFloors.contains(floor) {
+            queuedFloors.remove(floor)
+            calculateReverseFloors()
+            print("DEBUG: Removed floor \(floor) from queue")
+        } else {
+            queuedFloors.insert(floor)
+            calculateReverseFloors()
+            print("DEBUG: Added floor \(floor) to queue")
+
+            if elevatorState == .idle {
+                startElevatorJourney()
+            }
+        }
+        
+        // Clear selection after a brief moment
+        Task {
+            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+            selectedFloor = 0 // Clear selection so it shows proper state
+            print("DEBUG: Cleared selection after delay")
+        }
+    }
 
     func startElevatorJourney() {
-        guard !queuedFloors.isEmpty && elevatorState == .idle else { return }
+        print("DEBUG: startElevatorJourney() called, state: \(elevatorState), door state: \(doorState), queued floors: \(queuedFloors)")
+        guard !queuedFloors.isEmpty else { 
+            print("DEBUG: startElevatorJourney() - no queued floors")
+            return 
+        }
+        
+        // Can only start journey if idle, or if stopped with doors closed
+        guard elevatorState == .idle || (elevatorState == .stopped && doorState == .closed) else {
+            print("DEBUG: startElevatorJourney() - cannot start, elevator state: \(elevatorState), door state: \(doorState)")
+            return
+        }
 
         let sortedFloors = queuedFloors.sorted()
         if let closestFloor = sortedFloors.min(by: { abs($0 - currentFloor) < abs($1 - currentFloor) }) {
@@ -139,54 +225,364 @@ class ElevatorModel: ObservableObject {
         calculateReverseFloors()
         
         if queuedFloors.contains(currentFloor) {
-            elevatorState = .stopped
-            handleStoppedState()
+            print("DEBUG: Current floor \(currentFloor) is queued, stopping here")
+            stopElevator()
         } else {
+            print("DEBUG: Current floor not queued, starting movement to next destination")
             elevatorState = .moving
-            moveToNextFloor()
+            startMovementToNextFloor()
         }
     }
 
-    private func handleStoppedState() {
-        if queuedFloors.contains(currentFloor) {
-            queuedFloors.remove(currentFloor)
-            calculateReverseFloors()
-            
-            playArrivalChime()
-            
-            Task {
-                try await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
-                openDoors()
+    // MARK: - Public Methods
+    
+    /// Public method to stop the elevator (e.g., for emergency stop)
+    func forceStopElevator() {
+        print("DEBUG: forceStopElevator() called - current state: \(elevatorState)")
+        
+        // Cancel any ongoing floor progression
+        floorChangeTimer?.invalidate()
+        floorChangeTimer = nil
+        
+        // Stop immediately regardless of current state
+        elevatorState = .stopped
+        currentDirection = 0
+        
+        print("DEBUG: Emergency stop executed at floor \(currentFloor)")
+        
+        // Check if there are still queued floors and handle accordingly
+        if !queuedFloors.isEmpty {
+            print("DEBUG: Emergency stop - \(queuedFloors.count) floors still queued")
+            // Remove current floor from queue if it's there
+            if queuedFloors.contains(currentFloor) {
+                queuedFloors.remove(currentFloor)
+                calculateReverseFloors()
+                
+                // Open doors since we stopped at a queued floor
+                Task {
+                    try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
+                    await self.handleDoorCycle()
+                }
+            } else {
+                // Just stopped, don't open doors but allow continuing later
+                checkForNextMovement()
             }
         } else {
-            checkNextMove()
+            // No queued floors, go idle
+            elevatorState = .idle
+            print("DEBUG: Emergency stop - no queued floors, going idle")
         }
     }
     
-    private func checkNextMove() {
+    /// Completely halt all elevator operations (for app backgrounding, etc.)
+    func haltAllOperations() {
+        print("DEBUG: haltAllOperations() called")
+        
+        // Cancel all timers and tasks
+        floorChangeTimer?.invalidate()
+        floorChangeTimer = nil
+        touchIdleTimer?.invalidate() 
+        touchIdleTimer = nil
+        
+        // Set to idle state with doors closed
+        elevatorState = .idle
+        doorState = .closed
+        currentDirection = 0
+        doorOffset = 0.0
+        doorOpenCountdown = 0
+        
+        print("DEBUG: All elevator operations halted")
+    }
+    
+    // MARK: - Door State Management
+    
+    /// Open doors animation (only when stopped and doors closed)
+    private func openDoors() {
+        guard elevatorState == .stopped && doorState == .closed else {
+            print("DEBUG: Cannot open doors - elevator state: \(elevatorState), door state: \(doorState)")
+            return
+        }
+        
+        print("DEBUG: openDoors() - Starting door opening animation at floor \(currentFloor)")
+        
+        // DURING ANIMATION: Set to opening state
+        doorState = .opening
+        doorOffset = 1.0
+        
+        // Play arrival chime
+        playArrivalChime()
+        
+        // AFTER ANIMATION COMPLETES: Transition to open state
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            self.doorState = .open
+            print("DEBUG: openDoors() - Animation complete, doors are now OPEN")
+            
+            // Assert that we're in the correct state after animation
+            assert(self.elevatorState == .stopped, "Elevator should be stopped after door opening")
+            assert(self.doorState == .open, "Doors should be open after opening animation")
+        }
+    }
+    
+    /// Close doors animation (only when stopped and doors open)
+    private func closeDoors() {
+        guard elevatorState == .stopped && doorState == .open else {
+            print("DEBUG: Cannot close doors - elevator state: \(elevatorState), door state: \(doorState)")
+            return
+        }
+        
+        print("DEBUG: closeDoors() - Starting door closing animation at floor \(currentFloor)")
+        
+        // DURING ANIMATION: Set to closing state
+        doorState = .closing
+        doorOffset = 0.0
+        
+        // AFTER ANIMATION COMPLETES: Transition to closed state
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            self.doorState = .closed
+            print("DEBUG: closeDoors() - Animation complete, doors are now CLOSED - elevator can move again")
+            
+            // Assert that we're in the correct state after animation
+            assert(self.elevatorState == .stopped, "Elevator should be stopped after door closing")
+            assert(self.doorState == .closed, "Doors should be closed after closing animation")
+        }
+    }
+    
+    /// Complete door cycle: open → wait 3 seconds → close
+    private func handleDoorCycle() async {
+        print("DEBUG: Starting door cycle at floor \(currentFloor)")
+        
+        // Step 1: The elevator is stopped and the door is closed
+        print("DEBUG: Step 1 - Elevator stopped, doors closed")
+        assert(elevatorState == .stopped, "Elevator must be stopped to start door cycle")
+        assert(doorState == .closed, "Doors must be closed to start door cycle")
+        
+        // Step 2: openDoors() - play the door opening animation (synchronous call)
+        openDoors()
+        
+        // Wait for door opening animation to complete (doors transition from .opening to .open)
+        print("DEBUG: Step 2 - Waiting for door opening animation to complete...")
+        while doorState == .opening {
+            try? await Task.sleep(nanoseconds: 10_000_000) // 0.01 seconds polling
+        }
+        
+        // Assert that doors are now open after animation
+        assert(doorState == .open, "Doors should be open after opening animation completes")
+        
+        // Step 3: At this point the doors are open with the elevator stopped
+        print("DEBUG: Step 3 - Doors open, elevator stopped - waiting 3 seconds for passengers")
+        doorOpenCountdown = 3
+        
+        // Step 4: Await timer for 3 seconds
+        for countdown in (1...3).reversed() {
+            doorOpenCountdown = countdown
+            print("DEBUG: Door countdown: \(countdown) second\(countdown == 1 ? "" : "s") remaining")
+            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+        }
+        
+        doorOpenCountdown = 0
+        print("DEBUG: Step 4 - 3 seconds elapsed")
+        
+        // Step 5: closeDoors() - play the door closing animation (synchronous call)
+        closeDoors()
+        
+        // Wait for door closing animation to complete (doors transition from .closing to .closed)
+        print("DEBUG: Step 5 - Waiting for door closing animation to complete...")
+        while doorState == .closing {
+            try? await Task.sleep(nanoseconds: 10_000_000) // 0.01 seconds polling
+        }
+        
+        // Assert that doors are now closed after animation
+        assert(doorState == .closed, "Doors should be closed after closing animation completes")
+        
+        // Step 6: At this point the elevator is stopped and the doors are closed
+        print("DEBUG: Step 6 - Door cycle complete: elevator stopped, doors closed")
+        assert(elevatorState == .stopped, "Elevator should still be stopped after door cycle")
+        assert(doorState == .closed, "Doors should be closed after door cycle")
+        
+        // Now check for next movement
+        checkForNextMovement()
+    }
+    
+    /// Force doors to close immediately (for emergency or testing)
+    func forceCloseDoors() {
+        guard elevatorState == .stopped && doorState == .open else {
+            print("DEBUG: Cannot force close doors - elevator state: \(elevatorState), door state: \(doorState)")
+            return
+        }
+        
+        print("DEBUG: FORCE closing doors at floor \(currentFloor)")
+        doorOpenCountdown = 0  // Clear countdown immediately
+        
+        closeDoors()
+        
+        // Wait for door closing animation to complete before checking next movement
+        Task {
+            // Poll until doors are fully closed
+            while await MainActor.run(body: { self.doorState == .closing }) {
+                try? await Task.sleep(nanoseconds: 10_000_000) // 0.01 seconds polling
+            }
+            
+            await MainActor.run {
+                // Assert that doors are closed after force close
+                assert(self.doorState == .closed, "Doors should be closed after force close")
+                print("DEBUG: Force close animation complete - checking next movement")
+                self.checkForNextMovement()
+            }
+        }
+    }
+    
+    /// Test door timing by stopping at current floor and opening doors
+    func testDoorTiming() {
+        print("DEBUG: Testing door timing at current floor \(currentFloor)")
+        elevatorState = .stopped
+        doorState = .closed
+        Task {
+            await handleDoorCycle()
+        }
+    }
+    
+    /// Check if elevator should continue to next destination
+    private func checkForNextMovement() {
+        print("DEBUG: checkForNextMovement() called - state: \(elevatorState), door: \(doorState)")
+        
+        guard elevatorState == .stopped && doorState == .closed else {
+            print("DEBUG: Cannot move - elevator state: \(elevatorState), door state: \(doorState)")
+            return
+        }
+        
+        // Assert that we're in the correct state to check for movement
+        assert(elevatorState == .stopped, "Elevator must be stopped to check for next movement")
+        assert(doorState == .closed, "Doors must be closed to check for next movement")
+        
         guard !queuedFloors.isEmpty else {
+            print("DEBUG: No more queued floors - going idle")
             elevatorState = .idle
             currentDirection = 0
             upReverseFloor = 0
             downReverseFloor = 0
+            
+            // Assert transition to idle
+            assert(elevatorState == .idle, "Elevator should be idle when no queued floors")
+            assert(currentDirection == 0, "Direction should be 0 when idle")
             return
         }
         
+        print("DEBUG: \(queuedFloors.count) floors still queued - resuming movement")
         elevatorState = .moving
-        moveToNextFloor()
+        
+        // Assert transition to moving
+        assert(elevatorState == .moving, "Elevator should be moving when resuming to queued floors")
+        
+        startMovementToNextFloor()
     }
     
-    private func moveToNextFloor() {
-        guard elevatorState == .moving else { return }
+    // MARK: - Floor Movement Functions
+    
+    /// Increment floor by 1 (only if elevator should be moving up)
+    private func incrementFloor() -> Bool {
+        guard elevatorState == .moving && currentDirection > 0 else {
+            print("DEBUG: incrementFloor() blocked - state: \(elevatorState), direction: \(currentDirection)")
+            return false
+        }
+        
+        // Assert elevator is in correct state for movement
+        assert(elevatorState == .moving, "Elevator must be moving to increment floor")
+        assert(currentDirection > 0, "Direction must be up to increment floor")
+        
+        let newFloor = currentFloor + 1
+        guard newFloor <= totalFloors else {
+            print("DEBUG: incrementFloor() blocked - would exceed max floor \(totalFloors)")
+            return false
+        }
+        
+        print("DEBUG: incrementFloor() - moving from \(currentFloor) to \(newFloor)")
+        withAnimation(.easeInOut(duration: 0.3)) {
+            currentFloor = newFloor
+        }
+        
+        // Assert floor was incremented correctly
+        assert(currentFloor == newFloor, "Floor should be incremented to \(newFloor)")
+        return true
+    }
+    
+    /// Decrement floor by 1 (only if elevator should be moving down)  
+    private func decrementFloor() -> Bool {
+        guard elevatorState == .moving && currentDirection < 0 else {
+            print("DEBUG: decrementFloor() blocked - state: \(elevatorState), direction: \(currentDirection)")
+            return false
+        }
+        
+        // Assert elevator is in correct state for movement
+        assert(elevatorState == .moving, "Elevator must be moving to decrement floor")
+        assert(currentDirection < 0, "Direction must be down to decrement floor")
+        
+        let newFloor = currentFloor - 1
+        guard newFloor >= 1 else {
+            print("DEBUG: decrementFloor() blocked - would go below floor 1")
+            return false
+        }
+        
+        print("DEBUG: decrementFloor() - moving from \(currentFloor) to \(newFloor)")
+        withAnimation(.easeInOut(duration: 0.3)) {
+            currentFloor = newFloor
+        }
+        
+        // Assert floor was decremented correctly
+        assert(currentFloor == newFloor, "Floor should be decremented to \(newFloor)")
+        return true
+    }
+    
+    // MARK: - Private Methods
+    
+    private func stopElevator() {
+        print("DEBUG: stopElevator() called at floor \(currentFloor)")
+        
+        // Transition to stopped state
+        elevatorState = .stopped
+        doorState = .closed  // Doors start closed when we stop
+        
+        // Assert that elevator is now stopped with doors closed
+        assert(elevatorState == .stopped, "Elevator should be stopped after calling stopElevator")
+        assert(doorState == .closed, "Doors should be closed when elevator stops")
+        
+        // Remove current floor from queue if it's queued
+        if queuedFloors.contains(currentFloor) {
+            queuedFloors.remove(currentFloor)
+            calculateReverseFloors()
+            print("DEBUG: Elevator stopped at queued floor \(currentFloor) - will open doors")
+            
+            // Start the structured door cycle
+            Task {
+                try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds brief delay
+                await self.handleDoorCycle()
+            }
+        } else {
+            print("DEBUG: Elevator stopped at floor \(currentFloor) - checking for next move")
+            // Floor not queued, check for next move immediately
+            checkForNextMovement()
+        }
+    }
+
+
+    
+    private func startMovementToNextFloor() {
+        print("DEBUG: startMovementToNextFloor() called, current state: \(elevatorState)")
+        guard elevatorState == .moving else { 
+            print("DEBUG: startMovementToNextFloor() guard failed, state is \(elevatorState), expected .moving")
+            return 
+        }
         
         let nextFloor = getNextFloorInDirection()
+        print("DEBUG: Next floor in direction: \(nextFloor?.description ?? "nil")")
         
         guard let targetFloor = nextFloor else {
+            print("DEBUG: No target floor found, going idle")
             elevatorState = .idle
             currentDirection = 0
             return
         }
 
+        print("DEBUG: Starting animation from floor \(currentFloor) to floor \(targetFloor)")
         animateFloorProgression(from: currentFloor, to: targetFloor)
     }
     
@@ -219,67 +615,68 @@ class ElevatorModel: ObservableObject {
     }
     
     private func animateFloorProgression(from startFloor: Int, to endFloor: Int) {
+        print("DEBUG: animateFloorProgression() from \(startFloor) to \(endFloor)")
         floorChangeTimer?.invalidate()
         
         let timePerFloor: Double = 0.8
         let direction = endFloor > startFloor ? 1 : -1
         
-        var currentAnimatedFloor = startFloor
+        // Set the direction before starting
+        currentDirection = direction
         
-        floorChangeTimer = Timer.scheduledTimer(withTimeInterval: timePerFloor, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
+        // Run elevator movement in background thread
+        Task {
+            var targetReached = false
             
-            Task { @MainActor in
-                currentAnimatedFloor += direction
+            while !targetReached && elevatorState == .moving {
+                // Sleep for the time per floor (background thread)
+                try? await Task.sleep(nanoseconds: UInt64(timePerFloor * 1_000_000_000))
                 
-                withAnimation(.easeInOut(duration: 0.3)) {
-                    self.currentFloor = currentAnimatedFloor
-                }
-                
-                if self.queuedFloors.contains(currentAnimatedFloor) {
-                    self.floorChangeTimer?.invalidate()
-                    self.floorChangeTimer = nil
+                // Update UI on main thread
+                await MainActor.run { [weak self] in
+                    guard let self = self else { return }
                     
-                    self.elevatorState = .stopped
-                    self.handleStoppedState()
-                    return
-                }
-                
-                if currentAnimatedFloor == endFloor {
-                    self.floorChangeTimer?.invalidate()
-                    self.floorChangeTimer = nil
-
-                    self.elevatorState = .stopped
-                    self.handleStoppedState()
+                    // Check if we should still be moving
+                    guard self.elevatorState == .moving else {
+                        print("DEBUG: animateFloorProgression stopped - elevator state changed to \(self.elevatorState)")
+                        return
+                    }
+                    
+                    // Move to next floor using our safe functions
+                    let moved: Bool
+                    if direction > 0 {
+                        moved = self.incrementFloor()
+                    } else {
+                        moved = self.decrementFloor()
+                    }
+                    
+                    // If we couldn't move, stop the animation
+                    guard moved else {
+                        print("DEBUG: animateFloorProgression stopped - could not move floor")
+                        targetReached = true
+                        return
+                    }
+                    
+                    // Check if current floor is in queued floors - STOP if it is!
+                    if self.queuedFloors.contains(self.currentFloor) {
+                        print("DEBUG: animateFloorProgression - reached queued floor \(self.currentFloor)")
+                        self.stopElevator()
+                        targetReached = true
+                        return
+                    }
+                    
+                    // Check if we've reached the destination
+                    if self.currentFloor == endFloor {
+                        print("DEBUG: animateFloorProgression - reached destination floor \(endFloor)")
+                        self.stopElevator()
+                        targetReached = true
+                    }
                 }
             }
-        }
-    }
-
-    private func openDoors() {
-        guard elevatorState == .stopped else { return }
-        
-        elevatorState = .doorsOpening
-        doorOffset = 1.0
-
-        Task {
-            try await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
-            elevatorState = .doorsOpen
-
-            try await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds
-            closeDoors()
-        }
-    }
-
-    private func closeDoors() {
-        guard elevatorState == .doorsOpen else { return }
-        
-        elevatorState = .doorsClosing
-        doorOffset = 0.0
-
-        Task {
-            try await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
-            checkNextMove()
+            
+            await MainActor.run {
+                print("DEBUG: animateFloorProgression completed")
+            }
         }
     }
 }
